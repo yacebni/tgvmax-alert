@@ -39,6 +39,15 @@ https://api.telegram.org/bot<TOKEN_DU_BOT>/setWebhook?url=<URL_DU_WORKER>&secret
 9. **Settings** > **Triggers** > **Cron Triggers** > **Add** : `*/5 * * * *` (toutes les 5 minutes).
 10. **Deploy**, puis teste : `/surveiller demain aller 18:14` puis `/mes`.
 
+## Déploiement automatique (Workers Builds)
+
+Le Worker se redéploie à chaque `push` sur `main`, sans copier-coller :
+
+1. Worker `tgvmax-bot` > **Settings** > **Builds** > **Connect** > GitHub > dépôt `tgvmax-alert`.
+2. **Root directory** : `worker`, branche `main`, commande de déploiement `npx wrangler deploy`.
+3. La configuration (nom, binding KV `TARGETS`, cron `*/5 * * * *`) est dans `worker/wrangler.jsonc` : c'est elle qui fait foi, à modifier là et non dans le tableau de bord.
+4. Les secrets (`ALLOWED_CHAT_ID`, `WEBHOOK_SECRET`, `TELEGRAM_TOKEN`) restent dans Cloudflare et ne sont pas touchés par un déploiement.
+
 ## Limites
 
 - Données SNCF : disponibilité indicative, pas de nombre de places ; fenêtre de 30 jours.
