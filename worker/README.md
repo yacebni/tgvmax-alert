@@ -11,9 +11,13 @@ Le bot n'obéit qu'à ton `chat id` et vérifie un secret de webhook.
 | `/places 06/11 retour apres 17h` | Sens Lyon vers Paris, départs après 17h |
 | `/surveiller 13/11 aller 18:14` | Alerte dès qu'une place MAX s'ouvre sur ce train |
 | `/surveiller vendredi retour apres 17h` | Alerte sur n'importe quel train de la plage horaire |
+| `/surveiller chaque vendredi aller apres 17h` | Surveillance récurrente : chaque vendredi des 30 prochains jours, et les suivants ajoutés automatiquement |
+| `/surveiller chaque lundi retour avant 9h` | Idem pour le lundi, sens Lyon vers Paris, départs avant 9h |
 | `/mes` | Liste des surveillances |
 | `/stop 1` ou `/stop tout` | Arrête une ou toutes les surveillances |
 | `/aide` | Aide |
+
+Une règle récurrente crée une surveillance pour chaque jour concerné dans la fenêtre de 30 jours ; quand un nouveau jour y entre (les places MAX ouvrent environ 30 jours avant), il est ajouté tout seul et tu es prévenu dès que des places apparaissent. `/stop` sur une règle supprime aussi ses dates.
 
 Une alerte part à chaque *nouvelle* place (apparition, ou réapparition après disparition). Les surveillances expirent après la date du trajet. On peut surveiller jusqu'à 120 jours à l'avance : elles démarrent quand les trains entrent dans la fenêtre de 30 jours du jeu de données.
 
@@ -52,6 +56,6 @@ Le Worker se redéploie à chaque `push` sur `main`, sans copier-coller :
 
 - Données SNCF : disponibilité indicative, pas de nombre de places ; fenêtre de 30 jours.
 - Le cron s'exécute toutes les 5 minutes au mieux : une place très éphémère peut passer inaperçue.
-- 20 surveillances maximum. Plan gratuit Cloudflare : 100 000 requêtes par jour et 1 000 écritures KV par jour, très largement suffisant (une écriture seulement quand l'état d'une surveillance change).
+- Maximum 10 surveillances manuelles et 3 règles récurrentes (jusqu'à 5 dates chacune). Plan gratuit Cloudflare : 100 000 requêtes par jour, 1 000 écritures et 1 000 listes KV par jour, et 50 requêtes sortantes par exécution. Le cron fait une seule lecture KV (liste, avec les définitions en métadonnées) et ne lit une entrée que lorsque son état change : environ 20 requêtes par exécution dans le pire cas autorisé.
 - Un webhook actif empêche `getUpdates` de fonctionner (normal). Pour l'enlever : `.../deleteWebhook`.
 - Le token n'est stocké dans Cloudflare que pour les alertes planifiées (secret chiffré, jamais dans le code).

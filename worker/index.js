@@ -1,16 +1,23 @@
 // Bot Telegram "places MAX" : Cloudflare Worker.
 //
 // Commandes :
-//   /places <date> [aller|retour] [apres HH:MM] [avant HH:MM]   consultation immediate
-//   /surveiller <date> [aller|retour] <HH:MM>                    alerte sur un train precis
-//   /surveiller <date> [aller|retour] [apres HH:MM] [avant HH:MM]  alerte sur une plage horaire
-//   /mes                                                         liste des surveillances
-//   /stop <numero|tout>                                          arrete des surveillances
+//   /places <date> [aller|retour] [apres HH:MM] [avant HH:MM]        consultation immediate
+//   /surveiller <date> [aller|retour] <HH:MM>                         alerte sur un train precis
+//   /surveiller <date> [aller|retour] [apres HH:MM] [avant HH:MM]     alerte sur une plage horaire
+//   /surveiller chaque <jour> [aller|retour] [apres|avant HH:MM]      surveillance recurrente
+//   /mes                                                              liste des surveillances
+//   /stop <numero|tout>                                               arrete des surveillances
 //
-// Configuration Cloudflare :
+// Configuration Cloudflare (voir worker/wrangler.jsonc et worker/README.md) :
 //   Secrets   : ALLOWED_CHAT_ID, WEBHOOK_SECRET, TELEGRAM_TOKEN (alertes planifiees)
-//   Binding KV: TARGETS (stockage des surveillances)
+//   Binding KV: TARGETS
 //   Cron      : */5 * * * *
+//
+// Stockage KV : une cle par entree, la definition est dupliquee dans les metadonnees de la cle
+// (lecture par list() uniquement, sans get) ; la valeur contient en plus l'etat "seen".
+//   t:<chat>:<id>            surveillance manuelle
+//   t:<chat>:<regle>_<date>  occurrence creee par une regle recurrente
+//   r:<chat>:<id>            regle recurrente
 
 const BASE = "https://ressources.data.sncf.com/api/explore/v2.1/catalog/datasets/tgvmax/records";
 const PARIS = "FRPLY";
@@ -22,12 +29,14 @@ const STATIONS = {
   FRJDQ: "Lyon Saint-Exupery",
 };
 const DAYS_FR = ["dim", "lun", "mar", "mer", "jeu", "ven", "sam"];
+const DAY_NAMES = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];
 const WEEKDAYS = {
   dimanche: 0, lundi: 1, mardi: 2, mercredi: 3, jeudi: 4, vendredi: 5, samedi: 6,
 };
 const WINDOW_DAYS = 30; // fenetre du jeu de donnees
-const TARGET_WINDOW_DAYS = 120; // on accepte de surveiller plus loin : demarre a l'entree dans la fenetre
-const MAX_TARGETS = 20;
+const TARGET_WINDOW_DAYS = 120; // surveillance manuelle possible plus loin : demarre a l'entree dans la fenetre
+const MAX_TARGETS = 10; // surveillances manuelles
+const MAX_RULES = 3; // regles recurrentes (chacune cree jusqu'a 5 occurrences)
 
 const HELP = [
   "Consulter : /places <date> [aller|retour] [apres HH:MM] [avant HH:MM]",
@@ -38,12 +47,17 @@ const HELP = [
   "Etre prevenu : /surveiller <date> [aller|retour] <HH:MM>",
   "  /surveiller 13/11 aller 18:14   (un train precis)",
   "  /surveiller vendredi retour apres 17h   (n'importe quel train de la plage)",
+  "",
+  "Chaque semaine : /surveiller chaque <jour> [aller|retour] [apres HH:MM] [avant HH:MM]",
+  "  /surveiller chaque vendredi aller apres 17h",
+  "  /surveiller chaque lundi retour avant 9h",
+  "",
   "  /mes   liste des surveillances",
   "  /stop 1   ou   /stop tout",
   "",
   "aller = Paris vers Lyon (defaut), retour = Lyon vers Paris.",
   "Dates : demain, vendredi, 06/11, 06/11/2026, 2026-11-06.",
-  `Consultation : ${WINDOW_DAYS} prochains jours. Surveillance : jusqu'a ${TARGET_WINDOW_DAYS} jours.`,
+  `Consultation : ${WINDOW_DAYS} prochains jours. Surveillance manuelle : jusqu'a ${TARGET_WINDOW_DAYS} jours.`,
 ].join("\n");
 
 // ---------- dates ----------
@@ -68,6 +82,10 @@ function daysBetween(a, b) {
   return Math.round((isoToUtc(b) - isoToUtc(a)) / 86400000);
 }
 
+function weekdayOf(iso) {
+  return new Date(isoToUtc(iso)).getUTCDay();
+}
+
 function validIso(y, m, d) {
   const ms = Date.UTC(y, m - 1, d);
   const dt = new Date(ms);
@@ -85,8 +103,7 @@ export function parseDate(raw, today) {
   if (t === "demain") return addDays(today, 1);
   if (t === "apres-demain" || t === "apresdemain") return addDays(today, 2);
   if (t in WEEKDAYS) {
-    const todayDow = new Date(isoToUtc(today)).getUTCDay();
-    const diff = (WEEKDAYS[t] - todayDow + 7) % 7;
+    const diff = (WEEKDAYS[t] - weekdayOf(today) + 7) % 7;
     return addDays(today, diff);
   }
   let m = t.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
@@ -129,9 +146,27 @@ export function parseCommand(text, today) {
   if (!isWatch && !isPlaces) return { cmd: "unknown" };
   if (!parts.length) return { error: "Indique une date.\n\n" + HELP };
 
-  const dateTok = parts.shift();
-  const date = parseDate(dateTok, today);
-  if (!date) return { error: `Date non reconnue : "${dateTok}".\n\n${HELP}` };
+  // surveillance recurrente : "chaque vendredi" / "tous les vendredis"
+  let weekday = null;
+  if (isWatch) {
+    const first = stripAccents(parts[0].toLowerCase());
+    if (first === "chaque" || first === "tous") {
+      parts.shift();
+      if (first === "tous" && stripAccents((parts[0] || "").toLowerCase()) === "les") parts.shift();
+      const dayTok = stripAccents((parts.shift() || "").toLowerCase()).replace(/s$/, "");
+      if (!(dayTok in WEEKDAYS)) {
+        return { error: `Jour non reconnu : "${dayTok}". Exemple : /surveiller chaque vendredi aller apres 17h` };
+      }
+      weekday = WEEKDAYS[dayTok];
+    }
+  }
+
+  let date = null;
+  if (weekday === null) {
+    const dateTok = parts.shift();
+    date = parseDate(dateTok, today);
+    if (!date) return { error: `Date non reconnue : "${dateTok}".\n\n${HELP}` };
+  }
 
   let direction = "aller";
   let at = null;
@@ -156,6 +191,7 @@ export function parseCommand(text, today) {
   if (at && (after || before)) {
     return { error: "Choisis soit une heure precise, soit une plage (apres/avant), pas les deux." };
   }
+  if (weekday !== null) return { cmd: "watchRule", weekday, direction, at, after, before };
   return { cmd: isWatch ? "watch" : "places", date, direction, at, after, before };
 }
 
@@ -181,7 +217,7 @@ async function fetchDay(date, from, to, onlyAvail = true) {
       offset: String(offset),
       order_by: "date,heure_depart",
     })}`;
-    const resp = await fetch(url, { headers: { "User-Agent": "tgvmax-bot/0.2" } });
+    const resp = await fetch(url, { headers: { "User-Agent": "tgvmax-bot/0.3" } });
     if (!resp.ok) throw new Error(`SNCF open data HTTP ${resp.status}`);
     const data = await resp.json();
     const rows = data.results || [];
@@ -238,12 +274,30 @@ export function buildReply(date, direction, rows, after, before, at) {
   return [head, `${list.length} train(s) :`, ...lines].join("\n");
 }
 
-// ---------- surveillances (KV) ----------
-function describe(t) {
-  const what = t.at
+// ---------- stockage KV ----------
+function hashKeys(keys) {
+  if (!keys || !keys.length) return "0";
+  const s = [...keys].sort().join(",");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
+function timeLabel(t) {
+  return t.at
     ? t.at
     : [t.after && `apres ${t.after}`, t.before && `avant ${t.before}`].filter(Boolean).join(" ") || "tous les trains";
-  return `${fmtDay(t.date)} ${t.direction} ${what}`;
+}
+
+function describe(t) {
+  return `${fmtDay(t.date)} ${t.direction} ${timeLabel(t)}`;
+}
+
+function describeRule(r) {
+  return `chaque ${DAY_NAMES[r.weekday]} ${r.direction} ${timeLabel(r)}`;
 }
 
 function filtersOf(t) {
@@ -254,28 +308,57 @@ function expirationFor(date) {
   return Math.floor(isoToUtc(addDays(date, 2)) / 1000);
 }
 
-async function listTargets(env, chat) {
-  const prefix = chat ? `t:${chat}:` : "t:";
+function newId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(5));
+  return [...bytes].map((b) => (b % 36).toString(36)).join("");
+}
+
+// Ecrit une entree : valeur complete + definition en metadonnees (hash de l'etat inclus).
+async function saveEntry(env, e) {
+  const { key, isRule, h, ...value } = e;
+  const meta = {};
+  for (const f of ["chat", "date", "weekday", "direction", "at", "after", "before", "rule"]) {
+    if (value[f] !== undefined && value[f] !== null) meta[f] = value[f];
+  }
+  meta.h = hashKeys(value.seen);
+  const opts = { metadata: meta };
+  if (value.date) opts.expiration = expirationFor(value.date); // les regles n'expirent pas
+  await env.TARGETS.put(key, JSON.stringify(value), opts);
+}
+
+// Liste les entrees (regles et surveillances) sans lecture individuelle grace aux metadonnees.
+async function listEntries(env, chat) {
   const out = [];
   let cursor;
   do {
-    const res = await env.TARGETS.list({ prefix, cursor });
+    const res = await env.TARGETS.list({ cursor });
     for (const k of res.keys) {
-      const v = await env.TARGETS.get(k.name, "json");
-      if (v) out.push({ key: k.name, ...v });
+      if (chat && !k.name.startsWith(`t:${chat}:`) && !k.name.startsWith(`r:${chat}:`)) continue;
+      let m = k.metadata;
+      if (!m) {
+        // ancienne entree sans metadonnees : une lecture, rare
+        const v = await env.TARGETS.get(k.name, "json");
+        if (!v) continue;
+        const { seen, ...rest } = v;
+        m = { ...rest, h: hashKeys(seen) };
+      }
+      out.push({ key: k.name, isRule: k.name.startsWith("r:"), ...m });
     }
     cursor = res.list_complete ? undefined : res.cursor;
   } while (cursor);
-  return out.sort((a, b) =>
-    `${a.date} ${a.at || a.after || ""} ${a.direction} ${a.key}`.localeCompare(
-      `${b.date} ${b.at || b.after || ""} ${b.direction} ${b.key}`,
-    ),
-  );
+  return out;
 }
 
-async function saveTarget(env, t) {
-  const { key, ...value } = t;
-  await env.TARGETS.put(key, JSON.stringify(value), { expiration: expirationFor(t.date) });
+function splitEntries(all) {
+  const byDate = (a, b) =>
+    `${a.date} ${a.at || a.after || ""} ${a.direction} ${a.key}`.localeCompare(
+      `${b.date} ${b.at || b.after || ""} ${b.direction} ${b.key}`,
+    );
+  return {
+    rules: all.filter((e) => e.isRule).sort((a, b) => `${a.weekday} ${a.key}`.localeCompare(`${b.weekday} ${b.key}`)),
+    manual: all.filter((e) => !e.isRule && !e.rule).sort(byDate),
+    instances: all.filter((e) => !e.isRule && e.rule).sort(byDate),
+  };
 }
 
 function sameTarget(a, b) {
@@ -288,21 +371,60 @@ function sameTarget(a, b) {
   );
 }
 
-function newId() {
-  const bytes = crypto.getRandomValues(new Uint8Array(5));
-  return [...bytes].map((b) => (b % 36).toString(36)).join("");
+function sameRule(a, b) {
+  return (
+    a.weekday === b.weekday &&
+    a.direction === b.direction &&
+    (a.at || null) === (b.at || null) &&
+    (a.after || null) === (b.after || null) &&
+    (a.before || null) === (b.before || null)
+  );
 }
 
+function upcomingDates(weekday, today) {
+  const out = [];
+  for (let i = 0; i <= WINDOW_DAYS; i++) {
+    const d = addDays(today, i);
+    if (weekdayOf(d) === weekday) out.push(d);
+  }
+  return out;
+}
+
+function ruleIdOf(rule) {
+  return rule.key.split(":")[2];
+}
+
+function instanceKey(rule, date) {
+  return `t:${rule.chat}:${ruleIdOf(rule)}_${date}`; // deterministe : une recreation ecrase au lieu de dupliquer
+}
+
+function newInstance(rule, date, seen) {
+  return {
+    key: instanceKey(rule, date),
+    chat: rule.chat,
+    date,
+    direction: rule.direction,
+    at: rule.at,
+    after: rule.after,
+    before: rule.before,
+    rule: ruleIdOf(rule),
+    seen,
+  };
+}
+
+// ---------- commandes de surveillance ----------
+const NO_KV = "Stockage non configure (binding KV TARGETS manquant). Voir worker/README.md.";
+
 async function handleWatch(cmd, env, chat, today) {
-  if (!env.TARGETS) return "Stockage non configure (binding KV TARGETS manquant). Voir worker/README.md.";
+  if (!env.TARGETS) return NO_KV;
   const diff = daysBetween(today, cmd.date);
   if (diff < 0) return `${fmtDay(cmd.date)} est dans le passe.`;
   if (diff > TARGET_WINDOW_DAYS) return `${fmtDay(cmd.date)} est trop lointain (maximum ${TARGET_WINDOW_DAYS} jours).`;
 
-  const existing = await listTargets(env, chat);
+  const { manual } = splitEntries(await listEntries(env, chat));
   const candidate = { date: cmd.date, direction: cmd.direction, at: cmd.at, after: cmd.after, before: cmd.before };
-  if (existing.some((t) => sameTarget(t, candidate))) return `Deja surveille : ${describe(candidate)}.`;
-  if (existing.length >= MAX_TARGETS) return `Limite de ${MAX_TARGETS} surveillances atteinte. Retire-en avec /stop.`;
+  if (manual.some((t) => sameTarget(t, candidate))) return `Deja surveille : ${describe(candidate)}.`;
+  if (manual.length >= MAX_TARGETS) return `Limite de ${MAX_TARGETS} surveillances atteinte. Retire-en avec /stop.`;
 
   const { from, to } = routeCodes(cmd.direction);
   let seen = [];
@@ -320,42 +442,101 @@ async function handleWatch(cmd, env, chat, today) {
       } else {
         tail = "\nAucun train correspondant dans les donnees pour l'instant (horaire inconnu ou pas encore ouvert). Je surveille quand meme.";
       }
-    } catch (e) {
+    } catch {
       tail = "\n(Etat actuel non verifie : source SNCF indisponible. La surveillance demarre quand meme.)";
     }
   } else {
     tail = `\nHors fenetre actuelle (${WINDOW_DAYS} jours) : la surveillance demarrera quand ces trains y entreront.`;
   }
-  await saveTarget(env, { key: `t:${chat}:${newId()}`, chat, ...candidate, seen });
+  await saveEntry(env, { key: `t:${chat}:${newId()}`, chat, ...candidate, seen });
   return `Surveillance activee : ${describe(candidate)}.${tail}\nAlerte a chaque nouvelle place. /mes pour la liste, /stop pour arreter.`;
 }
 
-async function handleList(env, chat) {
-  if (!env.TARGETS) return "Stockage non configure (binding KV TARGETS manquant).";
-  const list = await listTargets(env, chat);
-  if (!list.length) return "Aucune surveillance active. Exemple : /surveiller 13/11 aller 18:14";
+async function handleWatchRule(cmd, env, chat, today) {
+  if (!env.TARGETS) return NO_KV;
+  const { rules } = splitEntries(await listEntries(env, chat));
+  const candidate = { weekday: cmd.weekday, direction: cmd.direction, at: cmd.at, after: cmd.after, before: cmd.before };
+  if (rules.some((r) => sameRule(r, candidate))) return `Deja surveille : ${describeRule(candidate)}.`;
+  if (rules.length >= MAX_RULES) return `Limite de ${MAX_RULES} regles recurrentes atteinte. Retire-en avec /stop.`;
+
+  const rule = { key: `r:${chat}:${newId()}`, chat, kind: "rule", ...candidate };
+  await saveEntry(env, rule);
+
+  // creation immediate des occurrences deja dans la fenetre, etat actuel memorise (pas d'alerte sur l'existant)
+  const { from, to } = routeCodes(cmd.direction);
+  const lines = [];
+  for (const date of upcomingDates(cmd.weekday, today)) {
+    try {
+      const rows = await fetchDay(date, from, to, true);
+      const current = selectRows(rows, cmd.direction, filtersOf(rule), true);
+      await saveEntry(env, newInstance(rule, date, current.map(rowKey)));
+      lines.push(`  ${fmtDay(date)} : ${current.length ? `${current.length} train(s) deja disponible(s)` : "en attente"}`);
+    } catch {
+      lines.push(`  ${fmtDay(date)} : etat non verifie (source indisponible)`);
+    }
+  }
   return [
-    "Surveillances actives :",
-    ...list.map((t, i) => `${i + 1}. ${describe(t)} ${t.seen && t.seen.length ? "(place disponible)" : "(en attente)"}`),
+    `Surveillance recurrente activee : ${describeRule(candidate)}.`,
+    "Dates suivies actuellement :",
+    ...lines,
+    "Les dates suivantes sont ajoutees automatiquement. /places <date> pour le detail, /mes pour la liste, /stop pour arreter.",
   ].join("\n");
 }
 
+function statusOf(t) {
+  return t.h && t.h !== "0" ? "place disponible" : "en attente";
+}
+
+function numbered(entries) {
+  const { rules, manual, instances } = splitEntries(entries);
+  return { rules, manual, instances, list: [...rules, ...manual] };
+}
+
+async function handleList(env, chat) {
+  if (!env.TARGETS) return NO_KV;
+  const { rules, manual, instances, list } = numbered(await listEntries(env, chat));
+  if (!list.length) return "Aucune surveillance active. Exemple : /surveiller 13/11 aller 18:14";
+  const lines = ["Surveillances actives :"];
+  let n = 1;
+  for (const r of rules) {
+    const ruleId = r.key.split(":")[2];
+    const dates = instances
+      .filter((t) => t.rule === ruleId)
+      .map((t) => `${fmtDay(t.date)} (${statusOf(t)})`);
+    lines.push(`${n++}. ${describeRule(r)} [recurrente]`);
+    if (dates.length) lines.push(`   ${dates.join(", ")}`);
+  }
+  for (const t of manual) lines.push(`${n++}. ${describe(t)} (${statusOf(t)})`);
+  return lines.join("\n");
+}
+
 async function handleStop(cmd, env, chat) {
-  if (!env.TARGETS) return "Stockage non configure (binding KV TARGETS manquant).";
-  const list = await listTargets(env, chat);
+  if (!env.TARGETS) return NO_KV;
+  const all = await listEntries(env, chat);
+  const { instances, list } = numbered(all);
   if (!list.length) return "Aucune surveillance active.";
+  const removeRule = async (r) => {
+    const ruleId = r.key.split(":")[2];
+    await Promise.all([
+      env.TARGETS.delete(r.key),
+      ...instances.filter((t) => t.rule === ruleId).map((t) => env.TARGETS.delete(t.key)),
+    ]);
+  };
+  const remove = (e) => (e.isRule ? removeRule(e) : env.TARGETS.delete(e.key));
   if (cmd.arg === "tout" || cmd.arg === "all") {
-    await Promise.all(list.map((t) => env.TARGETS.delete(t.key)));
+    await Promise.all(list.map(remove));
     return `${list.length} surveillance(s) arretee(s).`;
   }
   const n = Number(cmd.arg);
   if (!Number.isInteger(n) || n < 1 || n > list.length) {
     return `Indique un numero entre 1 et ${list.length} (voir /mes) ou "tout".`;
   }
-  await env.TARGETS.delete(list[n - 1].key);
-  return `Surveillance arretee : ${describe(list[n - 1])}.`;
+  const e = list[n - 1];
+  await remove(e);
+  return `Surveillance arretee : ${e.isRule ? describeRule(e) : describe(e)}.`;
 }
 
+// ---------- alertes planifiees (cron) ----------
 async function telegramSend(env, chat, text) {
   try {
     const resp = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
@@ -369,11 +550,24 @@ async function telegramSend(env, chat, text) {
   }
 }
 
-// Declenche par le cron : alerte sur les places nouvellement apparues.
 export async function runTargets(env) {
   if (!env.TARGETS || !env.TELEGRAM_TOKEN) return;
   const today = parisToday();
-  const targets = await listTargets(env);
+  const { rules, manual, instances } = splitEntries(await listEntries(env));
+  const targets = [...manual, ...instances];
+
+  // creation des occurrences manquantes des regles (idempotent : cle deterministe)
+  for (const rule of rules) {
+    const ruleId = ruleIdOf(rule);
+    for (const date of upcomingDates(rule.weekday, today)) {
+      if (targets.some((t) => t.rule === ruleId && t.date === date)) continue;
+      const inst = newInstance(rule, date, []);
+      await saveEntry(env, inst);
+      const { key, seen, ...meta } = inst;
+      targets.push({ key, ...meta, h: "0" }); // premiere ouverture => alerte
+    }
+  }
+
   const groups = new Map();
   for (const t of targets) {
     const diff = daysBetween(today, t.date);
@@ -386,6 +580,7 @@ export async function runTargets(env) {
     if (!groups.has(gk)) groups.set(gk, []);
     groups.get(gk).push(t);
   }
+
   for (const [gk, items] of groups) {
     const [date, direction] = gk.split("|");
     const { from, to } = routeCodes(direction);
@@ -398,16 +593,16 @@ export async function runTargets(env) {
     for (const t of items) {
       const current = selectRows(rows, direction, filtersOf(t), true);
       const currentKeys = current.map(rowKey);
-      const known = new Set(t.seen || []);
+      if (hashKeys(currentKeys) === (t.h || "0")) continue; // rien de change : aucune lecture
+      const full = await env.TARGETS.get(t.key, "json");
+      if (!full) continue;
+      const known = new Set(full.seen || []);
       const fresh = current.filter((r) => !known.has(rowKey(r)));
       if (fresh.length) {
-        const text =
-          "Place MAX ouverte !\n" + buildReply(date, direction, fresh, t.after, t.before, t.at);
-        if (!(await telegramSend(env, t.chat, text))) continue; // seen inchange : nouvel essai ensuite
+        const text = "Place MAX ouverte !\n" + buildReply(date, direction, fresh, t.after, t.before, t.at);
+        if (!(await telegramSend(env, t.chat, text))) continue; // etat inchange : nouvel essai ensuite
       }
-      const changed =
-        currentKeys.length !== known.size || currentKeys.some((k) => !known.has(k));
-      if (changed) await saveTarget(env, { ...t, seen: currentKeys });
+      await saveEntry(env, { ...full, key: t.key, seen: currentKeys });
     }
   }
 }
@@ -421,6 +616,7 @@ async function answer(text, env, chat) {
   if (cmd.cmd === "list") return handleList(env, chat);
   if (cmd.cmd === "stop") return handleStop(cmd, env, chat);
   if (cmd.cmd === "watch") return handleWatch(cmd, env, chat, today);
+  if (cmd.cmd === "watchRule") return handleWatchRule(cmd, env, chat, today);
 
   const diff = daysBetween(today, cmd.date);
   if (diff < 0) return `${fmtDay(cmd.date)} est dans le passe.`;
