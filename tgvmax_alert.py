@@ -282,12 +282,26 @@ def build_day_message(day, rows, o_iata, d_iata):
     return "\n".join(lines)
 
 
+def parse_user_date(text):
+    """Accepte AAAA-MM-JJ, JJ/MM/AAAA, JJ-MM-AAAA, JJ.MM.AAAA (zeros facultatifs)."""
+    t = str(text).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError(t)
+
+
 def cmd_day(args):
     try:
-        day = datetime.strptime(args.date, "%Y-%m-%d").date()
+        day = parse_user_date(args.date)
     except ValueError:
-        print("Date invalide : utiliser AAAA-MM-JJ", file=sys.stderr)
+        msg = f"Date invalide : \"{args.date}\". Format attendu : AAAA-MM-JJ (ex. 2026-11-06)."
+        notify(msg)
+        print(msg, file=sys.stderr)
         return 2
+    args.date = day.isoformat()
     if day < date.today():
         notify(f"Places MAX : {args.date} est dans le passe.")
         return 0
