@@ -1,0 +1,40 @@
+name: tgvmax-alert
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tgvmax-alert
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restaurer l'état
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Lancer la surveillance
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TGV_ARGS: ${{ secrets.TGV_ARGS }}
+        run: python3 tgvmax_alert.py watch $TGV_ARGS --once --state .state/seen.json
+
+      - name: Sauvegarder l'état
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
