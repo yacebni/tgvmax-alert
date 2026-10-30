@@ -1,0 +1,50 @@
+name: tgvmax-day
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Date du trajet (AAAA-MM-JJ)"
+        required: true
+      direction:
+        description: "Sens"
+        type: choice
+        options:
+          - aller (Paris vers Lyon)
+          - retour (Lyon vers Paris)
+        default: "aller (Paris vers Lyon)"
+      after:
+        description: "Départ à partir de (HH:MM, optionnel)"
+        required: false
+      before:
+        description: "Départ jusqu'à (HH:MM, optionnel)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lister les places MAX du jour
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          IN_DATE: ${{ inputs.date }}
+          IN_DIRECTION: ${{ inputs.direction }}
+          IN_AFTER: ${{ inputs.after }}
+          IN_BEFORE: ${{ inputs.before }}
+        run: |
+          if [[ "$IN_DIRECTION" == aller* ]]; then
+            FROM="FRPLY"; TO="FRLPD FRJDQ"
+          else
+            FROM="FRLPD FRJDQ"; TO="FRPLY"
+          fi
+          ARGS=()
+          [ -n "$IN_AFTER" ] && ARGS+=(--after "$IN_AFTER")
+          [ -n "$IN_BEFORE" ] && ARGS+=(--before "$IN_BEFORE")
+          python3 tgvmax_alert.py day --date "$IN_DATE" --from-iata $FROM --to-iata $TO "${ARGS[@]}"

@@ -5,6 +5,7 @@ Usage :
   python3 tgvmax_alert.py inspect
   python3 tgvmax_alert.py watch --from-iata FRPLY --to-iata FRLPD FRJDQ --after 17:00 --interval 600
   python3 tgvmax_alert.py watch --from-iata FRPLY --to-iata FRLPD FRJDQ --once   (cron, GitHub Actions)
+  python3 tgvmax_alert.py day --date 2026-11-06 --from-iata FRPLY --to-iata FRLPD FRJDQ
 
 Fonctionnement : a chaque passage, le script liste les places MAX disponibles, les compare
 a celles du passage precedent et n'envoie une alerte que pour celles qui viennent
@@ -265,6 +266,50 @@ def cmd_watch(args):
         time.sleep(args.interval)
 
 
+def build_day_message(day, rows, o_iata, d_iata):
+    o = " / ".join(STATIONS.get(c, c) for c in (o_iata or [])) or "?"
+    d = " / ".join(STATIONS.get(c, c) for c in (d_iata or [])) or "?"
+    head = f"Places MAX {fmt_day(day)} : {o} > {d}"
+    if not rows:
+        return head + "\nAucune place MAX disponible."
+    lines = [head, f"{len(rows)} train(s) :"]
+    for r in sorted(rows, key=lambda r: (str(r.get(F_DEP)), str(r.get(F_DEST_IATA)))):
+        lines.append(
+            f"  {r.get(F_DEP)} > {r.get(F_ARR)}  "
+            f"{station(r.get(F_ORIG_IATA), r.get(F_ORIG))} > "
+            f"{station(r.get(F_DEST_IATA), r.get(F_DEST))} (train {r.get(F_TRAIN)})"
+        )
+    return "\n".join(lines)
+
+
+def cmd_day(args):
+    try:
+        day = datetime.strptime(args.date, "%Y-%m-%d").date()
+    except ValueError:
+        print("Date invalide : utiliser AAAA-MM-JJ", file=sys.stderr)
+        return 2
+    if day < date.today():
+        notify(f"Places MAX : {args.date} est dans le passe.")
+        return 0
+    try:
+        rows = fetch_all(args.origin, args.dest, day, day, args.from_iata, args.to_iata, args.verbose)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"Erreur source : {e}", file=sys.stderr)
+        return 1
+    rows = [
+        r
+        for r in rows
+        if keep(r, args.origin, args.dest, args.after, args.before, args.from_iata, args.to_iata)
+    ]
+    # un meme train peut apparaitre en double : on garde une ligne par cle
+    uniq = {row_key(r): r for r in rows}
+    msg = build_day_message(args.date, list(uniq.values()), args.from_iata, args.to_iata)
+    if not uniq and day > date.today() + timedelta(days=30):
+        msg += "\n(Le jeu de donnees ne couvre que les 30 prochains jours.)"
+    notify(msg)
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -284,8 +329,18 @@ def main():
     w.add_argument("--state", default=str(Path.home() / ".tgvmax_seen.json"))
     w.add_argument("-v", "--verbose", action="store_true")
     w.set_defaults(fn=cmd_watch)
+    dy = sub.add_parser("day", help="liste les places MAX d'une date et d'un sens")
+    dy.add_argument("--date", required=True, help="AAAA-MM-JJ")
+    dy.add_argument("--from", dest="origin", help="texte de la gare d'origine")
+    dy.add_argument("--to", dest="dest", help="texte de la gare d'arrivee")
+    dy.add_argument("--from-iata", nargs="+", help="code(s) gare d'origine")
+    dy.add_argument("--to-iata", nargs="+", help="code(s) gare d'arrivee")
+    dy.add_argument("--after", help="depart a partir de HH:MM")
+    dy.add_argument("--before", help="depart jusqu'a HH:MM")
+    dy.add_argument("-v", "--verbose", action="store_true")
+    dy.set_defaults(fn=cmd_day)
     args = p.parse_args()
-    if args.cmd == "watch" and (
+    if args.cmd in ("watch", "day") and (
         not (args.origin or args.from_iata) or not (args.dest or args.to_iata)
     ):
         p.error("indiquer une origine (--from ou --from-iata) et une destination (--to ou --to-iata)")
