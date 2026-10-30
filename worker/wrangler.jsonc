@@ -6,5 +6,6 @@
     { "binding": "TARGETS", "id": "b41bc03b825d4329947525ea1bb891a8" }
   ],
   "triggers": { "crons": ["*/5 * * * *"] },
+  "preview_urls": false,
   "observability": { "enabled": true }
 }
